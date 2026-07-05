@@ -43,6 +43,7 @@ along with Foobar. If not, see <http://www.gnu.org/licenses/>.
 #include <map>
 #include <thread>
 #include <condition_variable>
+#include <atomic>
 
 // How many not-vehicles streams has every user by default? (e.g.: "default" and "chat" are not-vehicles streams)
 // This is used for the vehicle-limit
@@ -96,6 +97,26 @@ struct stream_traffic_t {
 class Client {
 public:
 
+    enum class SocketCleanupMode
+    {
+        NORMAL_DISCONNECT,
+        SERVER_SHUTDOWN
+    };
+
+    enum class SocketCleanupOwner
+    {
+        MAIN_SHUTDOWN,
+        KILLER_NORMAL,
+        KILLER_ACTIVE_SHUTDOWN,
+        KILLER_QUEUED_SHUTDOWN
+    };
+
+    enum class ShutdownMode
+    {
+        NORMAL,
+        SERVER_SHUTDOWN
+    };
+
     enum Status {
         STATUS_FREE = 0,
         STATUS_BUSY = 1,
@@ -106,7 +127,17 @@ public:
 
     void StartThreads();
 
-    void Disconnect();
+    bool SendWelcome();
+
+    void RequestServerShutdown();
+
+    void RequestWorkerStop();
+
+    void JoinWorkers();
+
+    void CleanupSocket(SocketCleanupMode mode, SocketCleanupOwner owner);
+
+    void Disconnect(SocketCleanupMode mode, SocketCleanupOwner owner);
 
     void QueueMessage(int msg_type, int client_id, unsigned int stream_id, unsigned int payload_len, const char *payload);
 
@@ -117,6 +148,8 @@ public:
     std::string GetIpAddress();
 
     SWInetSocket *GetSocket() { return m_socket; }
+
+    ShutdownMode GetShutdownMode() const { return m_shutdown_mode.load(std::memory_order_acquire); }
 
     bool IsBroadcasterDroppingPackets() const { return m_broadcaster.IsDroppingPackets(); }
 
@@ -151,6 +184,7 @@ private:
     Sequencer* m_sequencer;
     bool m_is_receiving_data;
     bool m_is_initialized;
+    std::atomic<ShutdownMode> m_shutdown_mode{ShutdownMode::NORMAL};
     std::vector<std::chrono::system_clock::time_point> m_stream_reg_timestamps; //!< To limit spawn rate
 };
 
@@ -203,14 +237,23 @@ class Sequencer {
     friend class ServerScript;
     friend class Blacklist;
 public:
+    enum class LifecycleState
+    {
+        ACCEPTING_CLIENTS,
+        SHUTTING_DOWN,
+        STOPPED
+    };
+
 
     // Startup and shutdown
     Sequencer();
     void Initialize();
+    void BeginShutdown();
+    bool IsAcceptingClients();
     void Close();
 
     // Synchronized public interface
-    void createClient(SWInetSocket *sock, RoRnet::UserInfo user);
+    bool createClient(SWInetSocket *sock, RoRnet::UserInfo user);
     void disconnectClient(int client_id, const char* error, bool isError = true, bool doScriptCallback = true);
     int getNumClients();
     void queueMessage(int uid, int type, unsigned int streamid, char *data, unsigned int len);
@@ -218,7 +261,8 @@ public:
     void frameStepScripts(float dt);
     void GetHeartbeatUserList(Json::Value &out_array);
     void UpdateMinuteStats();
-    int AuthorizeNick(std::string token, std::string &nickname);
+    unsigned int GetProspectiveAuthUid();
+    int AuthorizeNick(std::string token, std::string &nickname, unsigned int prospective_uid);
     std::vector<WebserverClientInfo> GetClientListCopy();
     int getStartTime();
 
@@ -257,7 +301,13 @@ private:
     void                     KillerThreadMain();
     KillerThreadState        KillerThreadWaitForClient(Client*& out_client);
     void                     KillerThreadProcessClient(Client* client);
+    void                     KillerThreadProcessShutdownBatch();
+    static void              CleanupClient(Client* client, Client::SocketCleanupMode mode,
+                                           Client::SocketCleanupOwner owner);
 
+    std::mutex m_close_mutex; //!< Serializes complete Sequencer teardown.
+    std::mutex m_lifecycle_mutex; //!< Serializes client admission against BeginShutdown().
+    LifecycleState m_lifecycle_state = LifecycleState::ACCEPTING_CLIENTS;
     std::mutex m_clients_mutex;  //!< Protects: m_clients, m_script_engine, m_auth_resolver, m_bot_count, m_num_disconnects_[total/crash]
     ScriptEngine *m_script_engine;
     UserAuth *m_auth_resolver;
@@ -278,5 +328,6 @@ private:
     std::condition_variable  m_killer_cond;
     std::mutex               m_killer_mutex;
     KillerThreadState        m_killer_state = KillerThreadState::NOT_RUNNING;
+    Client*                  m_killer_active_client = nullptr; //!< Protected exclusively by m_killer_mutex.
 };
 

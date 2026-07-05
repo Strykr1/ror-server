@@ -22,14 +22,33 @@ along with Foobar. If not, see <http://www.gnu.org/licenses/>.
 
 #include "utils.h"
 #include "logger.h"
-#include "SocketW.h"
+#include <curl/curl.h>
 
 #include <assert.h>
-#include <stdexcept>
 #include <vector>
-#include <sstream>
-#include <iostream>
 #include <cstring>
+
+namespace {
+
+size_t CurlWriteCallback(char *data, size_t size, size_t count, void *userdata)
+{
+    const size_t bytes = size * count;
+    static_cast<std::string *>(userdata)->append(data, bytes);
+    return bytes;
+}
+
+bool AppendHeader(curl_slist *&headers, const char *value)
+{
+    curl_slist *updated = curl_slist_append(headers, value);
+    if (updated == nullptr)
+    {
+        return false;
+    }
+    headers = updated;
+    return true;
+}
+
+} // namespace
 
 namespace Http {
 
@@ -37,6 +56,17 @@ namespace Http {
     const char *METHOD_POST = "POST";
     const char *METHOD_PUT = "PUT";
     const char *METHOD_DELETE = "DELETE";
+
+    bool Initialize()
+    {
+        CURLcode result = curl_global_init(CURL_GLOBAL_DEFAULT);
+        if (result != CURLE_OK)
+        {
+            Logger::Log(LOG_ERROR, "Unable to initialize bounded HTTP transport: %s", curl_easy_strerror(result));
+            return false;
+        }
+        return true;
+    }
 
 
     std::string RequestRaw(
@@ -47,34 +77,50 @@ namespace Http {
             std::string payload) {
         method = method.empty() ? METHOD_GET : method;
 
-        SWInetSocket socket;
-        SWInetSocket::SWBaseError result;
-        if (!socket.connect(80, host, &result) || (result != SWInetSocket::ok)) {
-            Logger::Log(LOG_ERROR,
-                        "Could not process HTTP %s request %s%s failed, error: %s",
-                        method.c_str(), host.c_str(), url.c_str(), result.get_error().c_str());
+        CURL *curl = curl_easy_init();
+        if (curl == nullptr) {
+            Logger::Log(LOG_ERROR, "Could not initialize an HTTP request");
             return "";
         }
 
-        std::string query = method + " " + url + " HTTP/1.1\r\nHost: " + host + "\r\nContent-Type: " +
-            content_type + "\r\nContent-Length: " + std::to_string(payload.length()) + "\r\n\r\n" + payload;
-
-        if (socket.fsendmsg(query, &result) < 0) {
-            Logger::Log(LOG_ERROR,
-                        "Could not process HTTP %s request %s%s failed, error: %s",
-                        method.c_str(), host.c_str(), url.c_str(), result.get_error().c_str());
+        curl_slist *headers = nullptr;
+        std::string content_type_header = "Content-Type: " + content_type;
+        if (!AppendHeader(headers, content_type_header.c_str()) ||
+            !AppendHeader(headers, "Expect:")) {
+            Logger::Log(LOG_ERROR, "Could not allocate HTTP request headers");
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
             return "";
         }
 
-        std::string response = socket.recvmsg(5000, &result);
-        if (result != SWInetSocket::ok) {
-            Logger::Log(LOG_ERROR,
-                        "Could not process HTTP %s request %s%s failed, invalid response length, error message: %s",
-                        method.c_str(), host.c_str(), url.c_str(), result.get_error().c_str());
+        std::string response;
+        std::string request_url = "http://" + host + url;
+        char error_buffer[CURL_ERROR_SIZE] = {};
+
+        curl_easy_setopt(curl, CURLOPT_URL, request_url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(payload.size()));
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_HEADER, 1L);
+        curl_easy_setopt(curl, CURLOPT_HTTP_TRANSFER_DECODING, 0L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
+
+        CURLcode result = curl_easy_perform(curl);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        if (result != CURLE_OK) {
+            const char *detail = error_buffer[0] != '\0' ? error_buffer : curl_easy_strerror(result);
+            Logger::Log(LOG_ERROR, "HTTP %s transport failed: %s", method.c_str(), detail);
             return "";
         }
 
-        socket.disconnect();
         return response;
     }
 
@@ -167,4 +213,3 @@ namespace Http {
     }
 
 } // namespace Http
-

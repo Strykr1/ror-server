@@ -26,6 +26,8 @@ along with Foobar. If not, see <http://www.gnu.org/licenses/>.
 
 namespace Http {
 
+    bool Initialize();
+
     extern const char *METHOD_GET;
     extern const char *METHOD_POST;
     extern const char *METHOD_PUT;
@@ -66,4 +68,3 @@ namespace Http {
             Response *out_response);
 
 } // namespace Http
-

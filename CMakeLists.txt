@@ -3,6 +3,7 @@ CMAKE_MINIMUM_REQUIRED(VERSION 3.1)
 
 project(rorserver VERSION "2021.10")
 
+find_package(CURL REQUIRED)
 # setup paths
 SET(RUNTIME_OUTPUT_DIRECTORY "${rorserver_SOURCE_DIR}/bin/")
 SET(LIBRARY_OUTPUT_DIRECTORY "${rorserver_SOURCE_DIR}/lib/")

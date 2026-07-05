@@ -25,6 +25,7 @@
 
 #include <mutex>
 #include <thread>
+#include <condition_variable>
 
 class Listener {
 private:
@@ -38,11 +39,19 @@ private:
     SWInetSocket m_listen_socket;
     ThreadState  m_thread_state = ThreadState::NOT_RUNNING;
     std::mutex   m_mutex;
+    std::condition_variable m_shutdown_complete;
+    bool         m_join_claimed = false;
     std::thread  m_thread;
     Sequencer*   m_sequencer = nullptr;
 
     void ThreadMain();
     ThreadState GetThreadState();
+    void WakeAccept();
+    int ReceiveHandshakeMessage(SWInetSocket *socket, int *type, int *source,
+            unsigned int *stream_id, unsigned int *payload_len, char *payload,
+            unsigned int payload_capacity);
+    int SendHandshakeMessage(SWInetSocket *socket, int type, int source,
+            unsigned int stream_id, unsigned int length, const char *payload);
 
 public:
     Listener(Sequencer *sequencer);

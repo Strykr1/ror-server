@@ -20,6 +20,8 @@ if (RORSERVER_WITH_ANGELSCRIPT)
     target_link_libraries(${PROJECT_NAME} PRIVATE angelscript)
 endif ()
 
+target_compile_definitions(${PROJECT_NAME} PRIVATE WITH_CURL)
+target_link_libraries(${PROJECT_NAME} PRIVATE CURL::libcurl)
 IF (WIN32)
     target_link_libraries(${PROJECT_NAME} PRIVATE mysocketw jsoncpp)
 ELSEIF (UNIX)
