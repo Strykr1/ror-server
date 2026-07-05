@@ -15,10 +15,8 @@ if (RORSERVER_WITH_ANGELSCRIPT)
     target_link_libraries(${PROJECT_NAME} PRIVATE Angelscript::angelscript angelscript_addons)
 endif ()
 
-if (RORSERVER_WITH_CURL)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE WITH_CURL)
-    target_link_libraries(${PROJECT_NAME} PRIVATE CURL::libcurl)
-endif ()
+target_compile_definitions(${PROJECT_NAME} PRIVATE WITH_CURL)
+target_link_libraries(${PROJECT_NAME} PRIVATE CURL::libcurl)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads SocketW::SocketW jsoncpp_lib)
 

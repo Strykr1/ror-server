@@ -28,6 +28,7 @@ along with Foobar. If not, see <http://www.gnu.org/licenses/>.
 #include "listener.h"
 #include "master-server.h"
 #include "utils.h"
+#include "http.h"
 
 #include "sha1_util.h"
 #include "sha1.h"
@@ -36,6 +37,9 @@ along with Foobar. If not, see <http://www.gnu.org/licenses/>.
 #include <cstdlib>
 #include <csignal>
 #include <stdexcept>
+#include <chrono>
+#include <thread>
+#include <atomic>
 
 #include <stdio.h>
 #include <string.h>
@@ -60,46 +64,37 @@ static Sequencer s_sequencer;
 static MasterServer::Client s_master_server;
 static bool s_exit_requested = false;
 #ifndef _WIN32
+static volatile sig_atomic_t s_shutdown_requested = 0;
+#else
+static std::atomic<bool> s_windows_shutdown_requested(false);
+#endif
 
-void handler(int signalnum) {
-    if (s_exit_requested) {
-        return;
-    }
-    s_exit_requested = true;
-    // reject handler
-    signal(signalnum, handler);
+#ifndef _WIN32
 
-    bool terminate = false;
-
-    if (signalnum == SIGINT) {
-        Logger::Log(LOG_ERROR, "got interrupt signal, terminating ...");
-        terminate = true;
-    } else if (signalnum == SIGTERM) {
-        Logger::Log(LOG_ERROR, "got terminate signal, terminating ...");
-        terminate = true;
-    } else if (signalnum == SIGHUP) {
-        Logger::Log(LOG_ERROR, "got HUP signal, terminating ...");
-        terminate = true;
-    } else {
-        Logger::Log(LOG_ERROR, "got unkown signal: %d", signal);
-    }
-
-    if (terminate) {
-        if (Config::getServerMode() == SERVER_LAN) {
-            Logger::Log(LOG_INFO, "closing server ... ");
-            s_sequencer.Close();
-        } else {
-            Logger::Log(LOG_INFO, "closing server ... unregistering ... ");
-            if (s_master_server.IsRegistered()) {
-                s_master_server.UnRegister();
-            }
-            s_sequencer.Close();
-        }
-        exit(0);
-    }
+void handler(int) {
+    s_shutdown_requested = 1;
 }
 
 #endif // ! _WIN32
+
+static bool ShutdownRequested()
+{
+#ifndef _WIN32
+    return s_shutdown_requested != 0 || s_exit_requested;
+#else
+    return s_windows_shutdown_requested.load(std::memory_order_acquire) || s_exit_requested;
+#endif
+}
+
+static bool SleepUntilShutdown(unsigned int seconds)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (!ShutdownRequested() && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return ShutdownRequested();
+}
 
 #ifdef _WIN32
 // Reference: https://msdn.microsoft.com/en-us/library/ms686016.aspx
@@ -108,30 +103,19 @@ BOOL WINAPI WindowsConsoleHandlerRoutine(DWORD ctrl_type)
     switch (ctrl_type)
     {
     case CTRL_C_EVENT:
-        Logger::Log(LOG_INFO, "Received `Ctrl+C` event.");
         break;
     case CTRL_BREAK_EVENT:
-        Logger::Log(LOG_INFO, "Received `Ctrl+Break` event.");
         break;
     case CTRL_CLOSE_EVENT:
-        Logger::Log(LOG_INFO, "Received `Close` event.");
         break;
     case CTRL_SHUTDOWN_EVENT:
-        Logger::Log(LOG_INFO, "Received `System shutdown` event.");
         break;
     default:
-        Logger::Log(LOG_WARN, "Received unknown console event: %lu.", static_cast<unsigned long>(ctrl_type));
         return TRUE; // Means 'event handled'
     }
 
-    if (s_master_server.IsRegistered())
-    {
-        Logger::Log(LOG_INFO, "Unregistering...");
-        s_master_server.UnRegister();
-    }
-    s_sequencer.Close(); // TODO: This somehow closes (crashes?) the process on Windows, debugger doesn't intercept anything...
-    Logger::Log(LOG_INFO, "Clean exit (Windows)");
-    ExitProcess(0); // Recommended by MSDN, see above link.
+    s_windows_shutdown_requested.store(true, std::memory_order_release);
+    return TRUE;
 }
 #endif
 
@@ -240,6 +224,10 @@ void daemonize() {
 #endif // ! _WIN32
 
 int main(int argc, char *argv[]) {
+    int return_code = 0;
+    bool listener_initialized = false;
+    bool sequencer_initialized = false;
+
     // set default verbose levels
     Logger::SetLogLevel(LOGTYPE_DISPLAY, LOG_INFO);
     Logger::SetLogLevel(LOGTYPE_FILE, LOG_VERBOSE);
@@ -255,6 +243,10 @@ int main(int argc, char *argv[]) {
     if (Config::GetShowVersion()) {
         Config::ShowVersion();
         return 0;
+    }
+
+    if (!Http::Initialize()) {
+        return -1;
     }
 
     // Check configuration
@@ -301,9 +293,16 @@ int main(int argc, char *argv[]) {
 
     // so ready to run, then set up signal handling
 #ifndef _WIN32
-    signal(SIGHUP, handler);
-    signal(SIGINT, handler);
-    signal(SIGTERM, handler);
+    struct sigaction shutdown_action;
+    memset(&shutdown_action, 0, sizeof(shutdown_action));
+    shutdown_action.sa_handler = handler;
+    sigemptyset(&shutdown_action.sa_mask);
+    if (sigaction(SIGHUP, &shutdown_action, nullptr) != 0 ||
+        sigaction(SIGINT, &shutdown_action, nullptr) != 0 ||
+        sigaction(SIGTERM, &shutdown_action, nullptr) != 0) {
+        Logger::Log(LOG_ERROR, "Failed to install shutdown signal handlers");
+        return -1;
+    }
 #else // _WIN32
     SetConsoleCtrlHandler(WindowsConsoleHandlerRoutine, TRUE);
 #endif // ! _WIN32
@@ -311,17 +310,20 @@ int main(int argc, char *argv[]) {
 
     Listener listener(&s_sequencer);
     if (!listener.Initialize()) {
-        return -1;
+        return_code = -1;
+        goto cleanup;
     }
+    listener_initialized = true;
     s_sequencer.Initialize();
+    sequencer_initialized = true;
 
     // Listener is ready, let's register ourselves on serverlist (which will contact us back to check).
     if (server_mode != SERVER_LAN) {
         bool registered = s_master_server.Register();
         if (!registered && (server_mode == SERVER_INET)) {
             Logger::Log(LOG_ERROR, "Failed to register on serverlist. Exit");
-            listener.Shutdown();
-            return -1;
+            return_code = -1;
+            goto cleanup;
         } else if (!registered) // server_mode == SERVER_AUTO
         {
             Logger::Log(LOG_WARN, "Failed to register on serverlist, continuing in LAN mode");
@@ -335,12 +337,14 @@ int main(int argc, char *argv[]) {
     // if we need to communiate to the master user the notifier routine
     if (server_mode != SERVER_LAN) {
         //heartbeat
-        while (!s_exit_requested) {
+        while (!ShutdownRequested()) {
             Messaging::UpdateMinuteStats();
             s_sequencer.UpdateMinuteStats();
 
             //every minute
-            Utils::SleepSeconds(Config::GetHeartbeatIntervalSec());
+            if (SleepUntilShutdown(Config::GetHeartbeatIntervalSec())) {
+                break;
+            }
 
             Logger::Log(LOG_VERBOSE, "Sending heartbeat...");
             Json::Value user_list(Json::arrayValue);
@@ -351,7 +355,9 @@ int main(int argc, char *argv[]) {
                 Logger::Log(LOG_WARN, "A heartbeat failed! Retry in %d seconds.", timeout);
                 bool success = false;
                 for (unsigned int i = 0; i < max_retries; ++i) {
-                    Utils::SleepSeconds(timeout);
+                    if (SleepUntilShutdown(timeout)) {
+                        break;
+                    }
                     success = s_master_server.SendHeatbeat(user_list);
 
                     LogLevel log_level = (success ? LOG_INFO : LOG_ERROR);
@@ -362,19 +368,20 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 if (!success) {
+                    if (ShutdownRequested()) {
+                        break;
+                    }
                     Logger::Log(LOG_ERROR, "Unable to send heartbeats, exit");
                     s_exit_requested = true;
+                    break;
                 }
             } else {
                 Logger::Log(LOG_VERBOSE, "Heartbeat sent OK");
             }
         }
 
-        if (s_master_server.IsRegistered()) {
-            s_master_server.UnRegister();
-        }
     } else {
-        while (!s_exit_requested) {
+        while (!ShutdownRequested()) {
             Messaging::UpdateMinuteStats();
             s_sequencer.UpdateMinuteStats();
 
@@ -382,12 +389,28 @@ int main(int argc, char *argv[]) {
             Messaging::broadcastLAN();
 
             // sleep a minute
-            Utils::SleepSeconds(60);
+            if (SleepUntilShutdown(60)) {
+                break;
+            }
         }
+
     }
 
-    s_sequencer.Close();
-    return 0;
+cleanup:
+    s_exit_requested = true;
+    if (listener_initialized) {
+        listener.Shutdown();
+    }
+
+    if (s_master_server.IsRegistered()) {
+        s_master_server.UnRegister();
+    }
+
+    if (sequencer_initialized) {
+        s_sequencer.Close();
+    }
+
+    return return_code;
 }
 
 #endif //WITHOUTMAIN

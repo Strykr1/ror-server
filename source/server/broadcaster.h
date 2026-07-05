@@ -53,15 +53,32 @@ public:
     ~Broadcaster();
 
     void Start(Client* client);
-    void Stop();
+    bool SendWelcome(Client* client, const RoRnet::UserInfo& user);
+    void RequestStop();
+    void Join();
+    void NotifyServerShutdown();
 
     void QueueMessage(int msg_type, int client_id, unsigned int streamid, unsigned int payload_len, const char *payload);
     bool IsDroppingPackets() const { return m_is_dropping_packets; }
 
 private:
+    enum class SendMode
+    {
+        NORMAL,
+        FINITE_DEADLINE
+    };
+
+    enum class TransmitResult
+    {
+        COMPLETED,
+        FAILED,
+        SHUTDOWN_DEADLINE_EXPIRED
+    };
+
     void  ThreadMain();
     ThreadState ThreadWaitForMessage(QueueEntry& out_message);
-    bool  ThreadTransmitMessage(QueueEntry const& message); //!< Returns false on error.
+    TransmitResult ThreadTransmitMessage(QueueEntry const& message, SendMode mode);
+    bool  ThreadTransmitServerLeave();
 
     // Thread context
     std::thread              m_thread;

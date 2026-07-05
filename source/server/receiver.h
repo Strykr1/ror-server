@@ -40,7 +40,8 @@ public:
     ~Receiver();
 
     void Start(Client* client);
-    void Stop();
+    void RequestStop();
+    void Join();
     ThreadState GetThreadState();
 
 private:
@@ -48,6 +49,7 @@ private:
     bool ThreadReceiveMessage(); //!< @return false if thread should be stopped, true to continue.
     bool ThreadReceiveHeader(); //!< @return false if thread should be stopped, true to continue.
     bool ThreadReceivePayload(); //!< @return false if thread should be stopped, true to continue.
+    bool ThreadReceiveExact(char* buffer, unsigned int length);
 
     Sequencer*  m_sequencer = nullptr; // global
     Client*     m_client = nullptr;    // data owner

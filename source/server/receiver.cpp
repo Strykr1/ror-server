@@ -44,24 +44,35 @@ void Receiver::Start(Client* client) {
 
     assert(m_thread_state == ThreadState::NOT_RUNNING);
     m_client = client;
-    m_thread = std::thread(&Receiver::ThreadMain, this);
     m_thread_state = ThreadState::RUNNING;
+    try {
+        m_thread = std::thread(&Receiver::ThreadMain, this);
+    } catch (...) {
+        m_thread_state = ThreadState::NOT_RUNNING;
+        throw;
+    }
 }
 
-void Receiver::Stop() {
+void Receiver::RequestStop() {
     {
         std::lock_guard<std::mutex> lock(m_mutex); // Scoped
-        if (m_thread_state != ThreadState::RUNNING)
-            return;
-        m_thread_state = ThreadState::STOP_REQUESTED;
+        if (m_thread_state == ThreadState::RUNNING) {
+            m_thread_state = ThreadState::STOP_REQUESTED;
+        }
     }
+}
 
+void Receiver::Join() {
+    if (!m_thread.joinable()) {
+        return;
+    }
     m_thread.join();
 
     {
         std::lock_guard<std::mutex> lock(m_mutex); // Scoped
         m_thread_state = ThreadState::NOT_RUNNING;
     }
+
 }
 
 Receiver::ThreadState Receiver::GetThreadState()
@@ -73,11 +84,8 @@ Receiver::ThreadState Receiver::GetThreadState()
 void Receiver::ThreadMain() {
     Logger::Log(LOG_DEBUG, "Started receiver thread (user ID %d)", m_client->GetUserId());
 
-    m_client->GetSocket()->set_timeout((Uint32)60, 0); // 60sec
     m_client->SetReceiveData(true);
     Logger::Log(LOG_VERBOSE, "UID %d is switching to FLOW", m_client->GetUserId());
-
-    m_sequencer->sendMOTDSynchronized(m_client->GetUserId());
 
     while (this->GetThreadState() == ThreadState::RUNNING) {
         if (!this->ThreadReceiveMessage()) {
@@ -124,12 +132,8 @@ bool Receiver::ThreadReceiveMessage()
 
 bool Receiver::ThreadReceiveHeader() //!< @return false if thread should be stopped, true to continue.
 {
-    SWBaseSocket::SWBaseError error;
-
     std::memset((void*)&m_recv_header, 0, sizeof(RoRnet::Header));
-    if (m_client->GetSocket()->frecv((char*)&m_recv_header, (int)sizeof(RoRnet::Header), &error) <= 0)
-    {
-        Logger::Log(LOG_WARN, "Receiver: error getting header: %s", error.get_error().c_str());
+    if (!ThreadReceiveExact(reinterpret_cast<char*>(&m_recv_header), sizeof(RoRnet::Header))) {
         return false; // stop thread.
     }
 
@@ -145,14 +149,35 @@ bool Receiver::ThreadReceiveHeader() //!< @return false if thread should be stop
 
 bool Receiver::ThreadReceivePayload() //!< @return false if thread should be stopped, true to continue.
 {
-    SWBaseSocket::SWBaseError error;
-
     std::memset(m_recv_payload, 0, RORNET_MAX_MESSAGE_LENGTH);
-    if (m_client->GetSocket()->frecv(m_recv_payload, (int)m_recv_header.size, &error) <= 0)
-    {
-        Logger::Log(LOG_WARN, "Receiver: error getting payload: %s", error.get_error().c_str());
+    if (!ThreadReceiveExact(m_recv_payload, m_recv_header.size)) {
         return false; // stop thread.
     }
 
     return true; // continue receiving.
+}
+
+bool Receiver::ThreadReceiveExact(char* buffer, unsigned int length)
+{
+    unsigned int received = 0;
+    while (received < length) {
+        if (GetThreadState() != ThreadState::RUNNING ||
+                m_client->GetShutdownMode() == Client::ShutdownMode::SERVER_SHUTDOWN) {
+            return false;
+        }
+
+        SWBaseSocket::SWBaseError error;
+        const int result = m_client->GetSocket()->recv(
+                buffer + received, static_cast<int>(length - received), &error);
+        if (result > 0) {
+            received += static_cast<unsigned int>(result);
+            continue;
+        }
+        if (error == SWBaseSocket::timeout || error == SWBaseSocket::interrupted) {
+            continue;
+        }
+        Logger::Log(LOG_WARN, "Receiver: receive error: %s", error.get_error().c_str());
+        return false;
+    }
+    return true;
 }

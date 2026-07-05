@@ -38,6 +38,8 @@ along with Foobar. If not, see <http://www.gnu.org/licenses/>.
 #include <iostream>
 #include <stdexcept>
 #include <sstream>
+#include <memory>
+#include <cassert>
 
 #ifdef __GNUC__
 
@@ -57,25 +59,70 @@ Client::Client(Sequencer *sequencer, SWInetSocket *socket) :
 }
 
 void Client::StartThreads() {
-    m_receiver.Start(this);
     m_broadcaster.Start(this);
+    m_sequencer->sendMOTD(GetUserId());
+    m_receiver.Start(this);
 }
 
-void Client::Disconnect() {
-    // Signal threads to stop and wait for them to finish
-    m_broadcaster.Stop();
-    m_receiver.Stop();
+bool Client::SendWelcome() {
+    return m_broadcaster.SendWelcome(this, user);
+}
 
-    // Disconnect the socket
-    SWBaseSocket::SWBaseError result;
-    bool disconnected_ok = m_socket->disconnect(&result);
-    if (!disconnected_ok || (result != SWBaseSocket::base_error::ok)) {
-        Logger::Log(
-                LOG_ERROR,
-                "Internal: Error while disconnecting client - failed to disconnect socket. Message: %s",
-                result.get_error().c_str());
+void Client::RequestServerShutdown() {
+    ShutdownMode expected = ShutdownMode::NORMAL;
+    if (m_shutdown_mode.compare_exchange_strong(
+            expected, ShutdownMode::SERVER_SHUTDOWN,
+            std::memory_order_release, std::memory_order_relaxed)) {
+        m_broadcaster.NotifyServerShutdown();
     }
-    delete m_socket;
+}
+
+void Client::RequestWorkerStop() {
+    m_broadcaster.RequestStop();
+    m_receiver.RequestStop();
+}
+
+void Client::JoinWorkers() {
+    m_broadcaster.Join();
+    m_receiver.Join();
+}
+
+void Client::CleanupSocket(SocketCleanupMode mode, SocketCleanupOwner owner) {
+    static_cast<void>(owner);
+    if (m_socket == nullptr) {
+        return;
+    }
+
+    // Disconnect() has already joined both workers. Detach the socket pointer
+    // before the sole cleanup owner closes and deletes it, making repeated
+    // cleanup calls harmless and preventing any later Client access.
+    SWInetSocket* socket = m_socket;
+    m_socket = nullptr;
+
+    if (mode == SocketCleanupMode::SERVER_SHUTDOWN) {
+        // SocketW::close_fd() closes the descriptor immediately, records
+        // myfd=-1, and resets progress state. The destructor therefore cannot
+        // close the native descriptor a second time.
+        socket->close_fd();
+    } else {
+        SWBaseSocket::SWBaseError result;
+        const bool disconnected_ok = socket->disconnect(&result);
+        if (!disconnected_ok || (result != SWBaseSocket::base_error::ok)) {
+            Logger::Log(
+                    LOG_ERROR,
+                    "Internal: Error while disconnecting client - failed to disconnect socket. Message: %s",
+                    result.get_error().c_str());
+        }
+    }
+    delete socket;
+}
+
+void Client::Disconnect(SocketCleanupMode mode, SocketCleanupOwner owner) {
+    // Signal threads to stop and wait for them to finish
+    RequestWorkerStop();
+    JoinWorkers();
+    CleanupSocket(mode, owner);
+
 }
 
 bool Client::CheckSpawnRate()
@@ -175,21 +222,54 @@ void Sequencer::Initialize() {
     m_blacklist.LoadBlacklistFromFile();
 }
 
+void Sequencer::BeginShutdown()
+{
+    std::lock_guard<std::mutex> lock(m_lifecycle_mutex);
+    if (m_lifecycle_state == LifecycleState::ACCEPTING_CLIENTS) {
+        m_lifecycle_state = LifecycleState::SHUTTING_DOWN;
+    }
+}
+
+bool Sequencer::IsAcceptingClients()
+{
+    std::lock_guard<std::mutex> lock(m_lifecycle_mutex);
+    return m_lifecycle_state == LifecycleState::ACCEPTING_CLIENTS;
+}
+
 /**
  * Cleanup function is to be called when the Sequencer is done being used
  * this is in place of the destructor.
  */
 void Sequencer::Close() {
+    std::lock_guard<std::mutex> close_lock(m_close_mutex);
+    BeginShutdown();
+
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
+        if (m_lifecycle_state == LifecycleState::STOPPED) {
+            return;
+        }
+    }
+
     Logger::Log(LOG_INFO, "closing. disconnecting clients ...");
 
-    const char *str = "server shutting down (try to reconnect later!)";
-    for (unsigned int i = 0; i < m_clients.size(); i++) {
-        // HACK-ISH override all thread stuff and directly send it!
-        Client *client = m_clients[i];
-        Messaging::SWSendMessage(client->GetSocket(), RoRnet::MSG2_USER_LEAVE, client->user.uniqueid, 0, strlen(str),
-                               str);
+    std::vector<Client*> shutdown_clients;
+    {
+        std::lock_guard<std::mutex> clients_lock(m_clients_mutex);
+        shutdown_clients.swap(m_clients);
+    }
+
+    for (Client* client : shutdown_clients) {
+        client->RequestServerShutdown();
+        client->RequestWorkerStop();
+    }
+    for (Client* client : shutdown_clients) {
+        CleanupClient(client, Client::SocketCleanupMode::SERVER_SHUTDOWN,
+                Client::SocketCleanupOwner::MAIN_SHUTDOWN);
     }
     Logger::Log(LOG_INFO, "all clients disconnected. exiting.");
+
+    this->StopKillerThread();
 
 #ifdef WITH_ANGELSCRIPT
     if (m_script_engine != nullptr) {
@@ -203,7 +283,10 @@ void Sequencer::Close() {
         m_auth_resolver = nullptr;
     }
 
-    this->StopKillerThread();
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
+        m_lifecycle_state = LifecycleState::STOPPED;
+    }
 }
 
 void Sequencer::StartKillerThread()
@@ -219,22 +302,47 @@ void Sequencer::StartKillerThread()
 
 void Sequencer::StopKillerThread()
 {
+    bool should_join = false;
+    bool should_wait = false;
+
     {
         std::lock_guard<std::mutex> lock(m_killer_mutex);
-        if (m_killer_state != KillerThreadState::RUNNING)
-        {
-            return;
+        if (m_killer_state == KillerThreadState::RUNNING) {
+            should_join = true;
+            m_killer_state = KillerThreadState::STOP_REQUESTED;
+            if (m_killer_active_client != nullptr) {
+                m_killer_active_client->RequestServerShutdown();
+            }
+            std::queue<Client*> queued_copy = m_kill_queue;
+            while (!queued_copy.empty()) {
+                queued_copy.front()->RequestServerShutdown();
+                queued_copy.pop();
+            }
+        } else if (m_killer_state == KillerThreadState::STOP_REQUESTED) {
+            should_wait = true;
         }
-        m_killer_state = KillerThreadState::STOP_REQUESTED;
     }
-    
+
+    if (should_wait) {
+        std::unique_lock<std::mutex> lock(m_killer_mutex);
+        m_killer_cond.wait(lock, [this]() {
+            return m_killer_state == KillerThreadState::NOT_RUNNING;
+        });
+        return;
+    }
+
+    if (!should_join) {
+        return;
+    }
+
     m_killer_cond.notify_one();
     m_killer_thread.join();
-
     {
         std::lock_guard<std::mutex> lock(m_killer_mutex);
         m_killer_state = KillerThreadState::NOT_RUNNING;
     }
+    m_killer_cond.notify_all();
+
 }
 
 bool Sequencer::CheckNickIsUnique(std::string &nick) {
@@ -270,10 +378,16 @@ int Sequencer::GetFreePlayerColour() {
     }
 }
 
-void Sequencer::createClient(SWInetSocket *sock, RoRnet::UserInfo user) {
+bool Sequencer::createClient(SWInetSocket *sock, RoRnet::UserInfo user) {
     //we have a confirmed client that wants to play
     //try to find a place for him
     Logger::Log(LOG_DEBUG, "got instance in createClient()");
+    // The lifecycle lock is the admission barrier. BeginShutdown() cannot
+    // complete while this final commit is in progress.
+    std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
+    if (m_lifecycle_state != LifecycleState::ACCEPTING_CLIENTS) {
+        return false;
+    }
 
     std::lock_guard<std::mutex> scoped_lock(m_clients_mutex);
 
@@ -283,7 +397,7 @@ void Sequencer::createClient(SWInetSocket *sock, RoRnet::UserInfo user) {
     if (Sequencer::IsBanned(sock->get_peerAddr(&error).c_str())) {
         Logger::Log(LOG_WARN, "rejected banned client '%s' with IP %s", nick.c_str(), sock->get_peerAddr(&error).c_str());
         Messaging::SWSendMessage(sock, RoRnet::MSG2_BANNED, 0, 0, 0, 0);
-        return;
+        return false;
     }
 
     // check if server is full
@@ -293,7 +407,6 @@ void Sequencer::createClient(SWInetSocket *sock, RoRnet::UserInfo user) {
                     Str::SanitizeUtf8(user.username).c_str());
         // set a low time out because we don't want to cause a back up of
         // connecting clients
-        sock->set_timeout(10, 0);
         Messaging::SWSendMessage(sock, RoRnet::MSG2_FULL, 0, 0, 0, 0);
         throw std::runtime_error("Server is full");
     }
@@ -319,12 +432,9 @@ void Sequencer::createClient(SWInetSocket *sock, RoRnet::UserInfo user) {
         }
     }
 
-    // Increase the botcount if this is a bot
-    if ((user.authstatus & RoRnet::AUTH_BOT) > 0)
-        m_bot_count++;
-
     //okay, create the client slot
-    Client *to_add = new Client(this, sock);
+    std::unique_ptr<Client> pending_client(new Client(this, sock));
+    Client *to_add = pending_client.get();
     to_add->user = user;
     to_add->user.colournum = Sequencer::GetFreePlayerColour();
     to_add->user.authstatus = user.authstatus;
@@ -344,21 +454,24 @@ void Sequencer::createClient(SWInetSocket *sock, RoRnet::UserInfo user) {
     unsigned int client_id = m_free_user_id;
     to_add->user.uniqueid = client_id;
 
-    // count up unique id
-    m_free_user_id++;
-
-    // add the client to the vector
+    // This insertion is the accepted-socket ownership transfer point.
     m_clients.push_back(to_add);
-    // create one thread for the receiver
-    // and one for the broadcaster
-    to_add->StartThreads();
+    pending_client.release();
+    m_free_user_id++;
+    if ((user.authstatus & RoRnet::AUTH_BOT) > 0)
+        m_bot_count++;
 
+    try {
     Logger::Log(LOG_VERBOSE, "Sending welcome message to uid %i", client_id);
-    if (Messaging::SWSendMessage(sock, RoRnet::MSG2_WELCOME, client_id, 0, sizeof(RoRnet::UserInfo),
-                               (char *) &to_add->user)) {
+    sock->set_timeout(1, 0);
+    if (!to_add->SendWelcome()) {
         this->QueueClientForDisconnect(client_id, "error sending welcome message");
-        return;
+        return true;
     }
+
+    // WELCOME completes before either worker starts. StartThreads starts the
+    // sole post-handshake sender before it starts the receiver.
+    to_add->StartThreads();
 
     // Do script callback
 #ifdef WITH_ANGELSCRIPT
@@ -381,6 +494,14 @@ void Sequencer::createClient(SWInetSocket *sock, RoRnet::UserInfo user) {
 
     // done!
     Logger::Log(LOG_VERBOSE, "Sequencer: New client added");
+    } catch (const std::exception& error) {
+        Logger::Log(LOG_ERROR, "Client startup failed after admission: %s", error.what());
+        this->QueueClientForDisconnect(client_id, "client startup failed after admission");
+    } catch (...) {
+        Logger::Log(LOG_ERROR, "Client startup failed after admission");
+        this->QueueClientForDisconnect(client_id, "client startup failed after admission");
+    }
+    return true;
 }
 
 void Sequencer::disconnectClient(int client_id, const char* error, bool isError /*= true*/, bool doScriptCallback /*= true*/)
@@ -434,12 +555,19 @@ int Sequencer::getNumClients() {
     return (int) m_clients.size();
 }
 
-int Sequencer::AuthorizeNick(std::string token, std::string &nickname) {
+unsigned int Sequencer::GetProspectiveAuthUid()
+{
     std::lock_guard<std::mutex> scoped_lock(m_clients_mutex);
+    return m_free_user_id;
+}
+
+int Sequencer::AuthorizeNick(std::string token, std::string &nickname, unsigned int prospective_uid) {
+    // Listener shutdown joins the sole authentication caller before Close()
+    // destroys the resolver. No lifecycle or client lock is held over HTTP.
     if (m_auth_resolver == nullptr) {
         return RoRnet::AUTH_NONE;
     }
-    return m_auth_resolver->resolve(token, nickname, m_free_user_id);
+    return m_auth_resolver->resolve(token, nickname, prospective_uid);
 }
 
 void Sequencer::KillerThreadMain()
@@ -452,6 +580,7 @@ void Sequencer::KillerThreadMain()
         if (state == KillerThreadState::STOP_REQUESTED)
         {
             Logger::Log(LOG_DEBUG, "Killer thread requested to stop");
+            this->KillerThreadProcessShutdownBatch();
             break;
         }
         else if (client)
@@ -464,26 +593,72 @@ void Sequencer::KillerThreadMain()
 KillerThreadState Sequencer::KillerThreadWaitForClient(Client*& out_client)
 {
     std::unique_lock<std::mutex> uni_lock(m_killer_mutex);
-    if (m_kill_queue.empty())
-    {
-        m_killer_cond.wait(uni_lock);
-    }
-    if (!m_kill_queue.empty())
+    m_killer_cond.wait(uni_lock, [this]() {
+        return m_killer_state == KillerThreadState::STOP_REQUESTED ||
+                !m_kill_queue.empty();
+    });
+    if (m_killer_state == KillerThreadState::RUNNING && !m_kill_queue.empty())
     {
         out_client = m_kill_queue.front();
         m_kill_queue.pop(); // pop front
+        m_killer_active_client = out_client;
     }
     return m_killer_state;
 }
 
 void Sequencer::KillerThreadProcessClient(Client* client)
 {
+    Client::SocketCleanupMode cleanup_mode = Client::SocketCleanupMode::NORMAL_DISCONNECT;
+    Client::SocketCleanupOwner cleanup_owner = Client::SocketCleanupOwner::KILLER_NORMAL;
     // Give the client time to disconnect itself
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    {
+        std::unique_lock<std::mutex> lock(m_killer_mutex);
+        m_killer_cond.wait_for(lock, std::chrono::seconds(5), [this]() {
+            return m_killer_state != KillerThreadState::RUNNING;
+        });
+        if (m_killer_state != KillerThreadState::RUNNING) {
+            cleanup_mode = Client::SocketCleanupMode::SERVER_SHUTDOWN;
+            cleanup_owner = Client::SocketCleanupOwner::KILLER_ACTIVE_SHUTDOWN;
+        }
+    }
 
     // Join the send/recv threads and close socket
-    client->Disconnect();
+    client->Disconnect(cleanup_mode, cleanup_owner);
 
+    {
+        std::lock_guard<std::mutex> lock(m_killer_mutex);
+        assert(m_killer_active_client == client);
+        m_killer_active_client = nullptr;
+    }
+    delete client;
+}
+
+void Sequencer::KillerThreadProcessShutdownBatch()
+{
+    std::vector<Client*> shutdown_clients;
+    {
+        std::lock_guard<std::mutex> lock(m_killer_mutex);
+        assert(m_killer_active_client == nullptr);
+        while (!m_kill_queue.empty()) {
+            shutdown_clients.push_back(m_kill_queue.front());
+            m_kill_queue.pop();
+        }
+    }
+
+    for (Client* client : shutdown_clients) {
+        client->RequestServerShutdown();
+        client->RequestWorkerStop();
+    }
+    for (Client* client : shutdown_clients) {
+        CleanupClient(client, Client::SocketCleanupMode::SERVER_SHUTDOWN,
+                Client::SocketCleanupOwner::KILLER_QUEUED_SHUTDOWN);
+    }
+}
+
+void Sequencer::CleanupClient(Client* client, Client::SocketCleanupMode mode,
+        Client::SocketCleanupOwner owner)
+{
+    client->Disconnect(mode, owner);
     delete client;
 }
 
@@ -524,18 +699,24 @@ void Sequencer::QueueClientForDisconnect(int uid, const char *errormsg, bool isE
             pos = i;
         }
     }
-    m_clients.erase(m_clients.begin() + pos);
+    // Transfer ownership directly from m_clients to m_kill_queue while both
+    // domains are locked. Once killer stop begins, leave ownership in m_clients
+    // for the main shutdown snapshot instead of creating an orphaned queue item.
+    {
+        std::lock_guard<std::mutex> lock(m_killer_mutex);
+        if (m_killer_state != KillerThreadState::RUNNING) {
+            Logger::Log(LOG_DEBUG,
+                    "Disconnect request for client ID %d deferred to shutdown owner", uid);
+            return;
+        }
+        m_clients.erase(m_clients.begin() + pos);
+        m_kill_queue.push(client);
+        Logger::Log(LOG_DEBUG, "adding client to kill queue, size: %zu", m_kill_queue.size());
+    }
 
     printStats();
 
-    //this routine is a potential trouble maker as it can be called from many thread contexts
-    //so we use a killer thread
     Logger::Log(LOG_VERBOSE, "Disconnecting client ID %d: %s", uid, errormsg);
-    Logger::Log(LOG_DEBUG, "adding client to kill queue, size: %d", m_kill_queue.size());
-    {
-        std::lock_guard<std::mutex> lock(m_killer_mutex);
-        m_kill_queue.push(client);
-    }
     m_killer_cond.notify_one();
 
     m_num_disconnects_total++;
