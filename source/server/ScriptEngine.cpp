@@ -346,7 +346,7 @@ void ScriptEngine::init() {
     RegisterScriptFile(engine);
     RegisterScriptAny(engine);
 
-    Logger::Log(LOG_INFO, "ScriptEngine: Registration of libs done, now custom things");
+    Logger::Log(LOG_VERBOSE, "ScriptEngine: Registration of libs done, now custom things");
 
     // Register ServerScript class
     result = engine->RegisterObjectType("ServerScriptClass", sizeof(ServerScript), asOBJ_REF | asOBJ_NOCOUNT);
@@ -990,8 +990,8 @@ void ScriptEngine::addCallback(const std::string &type, asIScriptFunction *func,
     }
 
     // finished :)
-    Logger::Log(LOG_INFO, "ScriptEngine: success: Added a '" + type + "' callback for: " +
-                          std::string(func->GetDeclaration(true)));
+    Logger::Log(LOG_VERBOSE, "ScriptEngine: success: Added a '" + type + "' callback for: " +
+                             std::string(func->GetDeclaration(true)));
 }
 
 void ScriptEngine::deleteCallbackScript(const std::string &type, const std::string &_func, asIScriptObject *obj) {
