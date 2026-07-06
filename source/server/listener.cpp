@@ -291,7 +291,7 @@ void Listener::ThreadMain() {
         if (error != SWBaseSocket::ok) {
             if (GetThreadState() == ThreadState::STOP_REQUESTED) {
                 Logger::Log(LOG_ERROR, "INFO Listener shutting down");
-            } else {
+            } else if (error != SWBaseSocket::timeout) {
                 Logger::Log(LOG_ERROR, "ERROR Listener: %s", error.get_error().c_str());
             }
             continue;
